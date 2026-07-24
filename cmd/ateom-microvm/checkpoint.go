@@ -28,6 +28,7 @@ import (
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/kata"
 	"github.com/agent-substrate/substrate/internal/ateompath"
 	"github.com/agent-substrate/substrate/internal/imagecache"
+	"github.com/agent-substrate/substrate/internal/operationstate"
 	"github.com/agent-substrate/substrate/internal/proto/ateompb"
 )
 
@@ -52,6 +53,21 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	templateNS := req.GetActorTemplateNamespace()
 	templateName := req.GetActorTemplateName()
 
+	operations := s.operationStore(actorUID)
+	var snapshotFiles []string
+	if req.GetOperationId() != "" {
+		operation, err := operations.Load(req.GetOperationId())
+		if err != nil {
+			return nil, fmt.Errorf("while loading CheckpointWorkload operation: %w", err)
+		}
+		if operation != nil && operation.Phase == operationstate.PhaseCompleted {
+			return &ateompb.CheckpointWorkloadResponse{SnapshotFiles: operation.SnapshotFiles}, nil
+		}
+		if operation != nil && operation.Phase == operationstate.PhasePrepared {
+			snapshotFiles = operation.SnapshotFiles
+		}
+	}
+
 	s.actorLogger.EmitLifecycleLog("Actor checkpointing", atespace, name, actorUID, templateNS, templateName)
 
 	// The actor's CH was booted by RunWorkload or relaunched by RestoreWorkload;
@@ -62,77 +78,75 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 		chSocket = ra.apiSocket
 	}
 	client := ch.NewClient(chSocket)
-	if err := client.WaitReady(ctx, 10*time.Second); err != nil {
-		return nil, fmt.Errorf("while waiting for CH api-socket: %w", err)
-	}
-
-	tPause := time.Now()
-	if err := client.Pause(ctx); err != nil {
-		return nil, fmt.Errorf("while pausing guest: %w", err)
-	}
-	dPause := time.Since(tPause)
-
-	checkpointDir := ateompath.CheckpointStateDir(actorUID)
-	// Start from a clean dir so CH's snapshot files are the only contents.
-	if err := os.RemoveAll(checkpointDir); err != nil {
-		return nil, fmt.Errorf("while clearing checkpoint dir %q: %w", checkpointDir, err)
-	}
-	if err := os.MkdirAll(checkpointDir, 0o700); err != nil {
-		return nil, fmt.Errorf("while creating checkpoint dir %q: %w", checkpointDir, err)
-	}
-
-	// Record the FROZEN base id (the id the guest's virtio-fs find-paths are pinned
-	// to, <baseID>/rootfs). For a cold-run actor this is its own id; for a restored
-	// actor it is the golden id propagated via ra.baseID (set from the snapshot we
-	// restored from). RestoreWorkload reads this to lay the
-	// reconstructed-from-image base at the path the guest expects. We can NOT derive
-	// it from config.json (its socket paths get rewritten to the current id on every
-	// restore, losing the invariant golden id).
-	baseID := actorUID
-	if ra != nil && ra.baseID != "" {
-		baseID = ra.baseID
-	}
-	if err := os.WriteFile(filepath.Join(checkpointDir, baseIDFile), []byte(baseID), 0o600); err != nil {
-		return nil, fmt.Errorf("while writing %s: %w", baseIDFile, err)
-	}
-
-	slog.InfoContext(ctx, "Snapshotting guest", slog.String("id", actorUID), slog.String("dir", checkpointDir))
-	tSnapshot := time.Now()
-	if err := client.Snapshot(ctx, checkpointDir); err != nil {
-		return nil, fmt.Errorf("while snapshotting guest: %w", err)
-	}
-	dSnapshot := time.Since(tSnapshot)
-
-	// Diff-snapshot completion for an OnDemand-restored actor: CH's snapshot here is
-	// sparse — only the pages faulted in since the OnDemand restore — so on its own
-	// it's INCOMPLETE (the un-faulted pages were being demand-paged from the restore
-	// source). Overlay it onto that source to rebuild a COMPLETE memory-ranges, so the
-	// snapshot is self-contained and re-restorable. (A cold-run actor has no restore
-	// source and its snapshot is already complete — no merge.)
-	if ra != nil && ra.restoreSourceDir != "" {
-		base := filepath.Join(ra.restoreSourceDir, "memory-ranges")
-		delta := filepath.Join(checkpointDir, "memory-ranges")
-		tMerge := time.Now()
-		// Reuse base's on-disk working set (rename + overlay) instead of copying it —
-		// CH is paused and about to be torn down, and base is discarded after. See
-		// MergeDeltaIntoBase. (Falls back to the copying merge across filesystems.)
-		if err := ch.MergeDeltaIntoBase(ctx, base, delta); err != nil {
-			return nil, fmt.Errorf("while merging OnDemand delta into restore source: %w", err)
+	var dPause, dSnapshot time.Duration
+	if len(snapshotFiles) == 0 {
+		if err := client.WaitReady(ctx, 10*time.Second); err != nil {
+			return nil, fmt.Errorf("while waiting for CH api-socket: %w", err)
 		}
-		slog.InfoContext(ctx, "Merged OnDemand delta into base (complete snapshot)",
-			slog.String("id", actorUID), slog.Duration("merge", time.Since(tMerge)))
-	}
 
-	// Nothing rootfs-related ships: the overlay's writable upper is a guest tmpfs, so
-	// the actor's rootfs writes are already in the memory snapshot above, and the RO
-	// lower is reconstructed from the OCI image at restore (it never changes).
+		tPause := time.Now()
+		if err := client.Pause(ctx); err != nil {
+			return nil, fmt.Errorf("while pausing guest: %w", err)
+		}
+		dPause = time.Since(tPause)
 
-	// Report exactly the files we wrote so atelet ships precisely the CH snapshot
-	// (config.json + state.json + memory-ranges + base-id). The RO base is
-	// reconstructed from the OCI image at restore.
-	snapshotFiles, err := listFiles(checkpointDir)
-	if err != nil {
-		return nil, fmt.Errorf("while listing snapshot files: %w", err)
+		checkpointDir := ateompath.CheckpointStateDir(actorUID)
+		// Start from a clean dir so CH's snapshot files are the only contents.
+		if err := os.RemoveAll(checkpointDir); err != nil {
+			return nil, fmt.Errorf("while clearing checkpoint dir %q: %w", checkpointDir, err)
+		}
+		if err := os.MkdirAll(checkpointDir, 0o700); err != nil {
+			return nil, fmt.Errorf("while creating checkpoint dir %q: %w", checkpointDir, err)
+		}
+
+		// Record the FROZEN base id (the id the guest's virtio-fs find-paths are pinned
+		// to, <baseID>/rootfs). For a cold-run actor this is its own id; for a restored
+		// actor it is the golden id propagated via ra.baseID.
+		baseID := actorUID
+		if ra != nil && ra.baseID != "" {
+			baseID = ra.baseID
+		}
+		if err := os.WriteFile(filepath.Join(checkpointDir, baseIDFile), []byte(baseID), 0o600); err != nil {
+			return nil, fmt.Errorf("while writing %s: %w", baseIDFile, err)
+		}
+
+		slog.InfoContext(ctx, "Snapshotting guest", slog.String("id", actorUID), slog.String("dir", checkpointDir))
+		tSnapshot := time.Now()
+		if err := client.Snapshot(ctx, checkpointDir); err != nil {
+			return nil, fmt.Errorf("while snapshotting guest: %w", err)
+		}
+		dSnapshot = time.Since(tSnapshot)
+
+		// Complete a sparse snapshot taken after an OnDemand restore.
+		if ra != nil && ra.restoreSourceDir != "" {
+			base := filepath.Join(ra.restoreSourceDir, "memory-ranges")
+			delta := filepath.Join(checkpointDir, "memory-ranges")
+			tMerge := time.Now()
+			if err := ch.MergeDeltaIntoBase(ctx, base, delta); err != nil {
+				return nil, fmt.Errorf("while merging OnDemand delta into restore source: %w", err)
+			}
+			slog.InfoContext(ctx, "Merged OnDemand delta into base (complete snapshot)",
+				slog.String("id", actorUID), slog.Duration("merge", time.Since(tMerge)))
+		}
+
+		// Nothing rootfs-related ships: the overlay's writable upper is in guest RAM.
+
+		var err error
+		snapshotFiles, err = listFiles(checkpointDir)
+		if err != nil {
+			return nil, fmt.Errorf("while listing snapshot files: %w", err)
+		}
+		if len(snapshotFiles) == 0 {
+			return nil, fmt.Errorf("checkpoint produced no snapshot files")
+		}
+		if req.GetOperationId() != "" {
+			if err := operations.Save(req.GetOperationId(), operationstate.Record{
+				Phase:         operationstate.PhasePrepared,
+				SnapshotFiles: snapshotFiles,
+			}); err != nil {
+				return nil, fmt.Errorf("while recording captured CheckpointWorkload operation: %w", err)
+			}
+		}
 	}
 
 	// Tear down: the actor returns to "available". Best-effort; the snapshot is
@@ -145,6 +159,14 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	// Tear down the per-activation actor network.
 	if err := s.cleanupActorNetwork(ctx); err != nil {
 		slog.WarnContext(ctx, "Failed to clean up actor network after checkpoint", slog.Any("err", err))
+	}
+	if req.GetOperationId() != "" {
+		if err := operations.Save(req.GetOperationId(), operationstate.Record{
+			Phase:         operationstate.PhaseCompleted,
+			SnapshotFiles: snapshotFiles,
+		}); err != nil {
+			return nil, fmt.Errorf("while recording completed CheckpointWorkload operation: %w", err)
+		}
 	}
 
 	s.actorLogger.EmitLifecycleLog("Actor checkpointed", atespace, name, actorUID, templateNS, templateName)

@@ -207,6 +207,9 @@ type AteomService struct {
 	// pause+snapshot+teardown the same sandbox (and RestoreWorkload can track the
 	// CH it relaunched).
 	running map[string]*runningActor
+
+	// operationsDir is overridden by unit tests.
+	operationsDir func(actorUID string) string
 }
 
 var _ ateompb.AteomServer = (*AteomService)(nil)

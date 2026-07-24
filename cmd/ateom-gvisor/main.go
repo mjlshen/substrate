@@ -33,6 +33,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/ateompath"
 	"github.com/agent-substrate/substrate/internal/contextlogging"
 	"github.com/agent-substrate/substrate/internal/imagecache"
+	"github.com/agent-substrate/substrate/internal/operationstate"
 	"github.com/agent-substrate/substrate/internal/proto/ateompb"
 	"github.com/agent-substrate/substrate/internal/readyz"
 	"github.com/agent-substrate/substrate/internal/serverboot"
@@ -165,6 +166,9 @@ type AteomService struct {
 
 	interiorNetNS netns.NsHandle
 	actorLogger   *actorlog.ActorLogger
+
+	// operationsDir is overridden by unit tests.
+	operationsDir func(actorUID string) string
 }
 
 var _ ateompb.AteomServer = (*AteomService)(nil)
@@ -260,6 +264,21 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
+	operations := s.operationStore(req.GetActorUid())
+	var snapshotFiles []string
+	if req.GetOperationId() != "" {
+		operation, err := operations.Load(req.GetOperationId())
+		if err != nil {
+			return nil, fmt.Errorf("while loading CheckpointWorkload operation: %w", err)
+		}
+		if operation != nil && operation.Phase == operationstate.PhaseCompleted {
+			return &ateompb.CheckpointWorkloadResponse{SnapshotFiles: operation.SnapshotFiles}, nil
+		}
+		if operation != nil && operation.Phase == operationstate.PhasePrepared {
+			snapshotFiles = operation.SnapshotFiles
+		}
+	}
+
 	s.actorLogger.EmitLifecycleLog("Actor checkpointing", req.GetAtespace(), req.GetActorName(), req.GetActorUid(), req.GetActorTemplateNamespace(), req.GetActorTemplateName())
 
 	// Contract with atelet:
@@ -277,27 +296,48 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 		return nil, fmt.Errorf("while creating checkpoint directory: %w", err)
 	}
 
-	// Always take durable-dir snapshot if at least one container has a durable-dir volume mount.
-	// TODO(dberkov): this is a temporary workaround until gVisor supports taking durable-dir snapshots in a single request with the process snapshot.
-	switch req.GetScope() {
-	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_DATA:
-		var ddv []string
-		for _, ctr := range req.GetSpec().GetContainers() {
-			ddv = append(ddv, ctr.GetDurableDirVolumes()...)
+	if len(snapshotFiles) == 0 {
+		// Always take durable-dir snapshot if at least one container has a durable-dir volume mount.
+		// TODO(dberkov): this is a temporary workaround until gVisor supports taking durable-dir snapshots in a single request with the process snapshot.
+		switch req.GetScope() {
+		case ateompb.SnapshotScope_SNAPSHOT_SCOPE_DATA:
+			var ddv []string
+			for _, ctr := range req.GetSpec().GetContainers() {
+				ddv = append(ddv, ctr.GetDurableDirVolumes()...)
+			}
+			if len(ddv) == 0 {
+				return nil, fmt.Errorf("no durable-dir volumes found for DATA snapshot")
+			}
+			if err := rcmd.cmdFsCheckpoint(ctx, "pause", checkpointPath, ddv); err != nil {
+				return nil, fmt.Errorf("while fscheckpointing durable-dir %q: %w", ddv[0], err)
+			}
+		case ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL:
+			// Checkpoint pause container (root of the sandbox)
+			if err := rcmd.cmdCheckpoint(ctx, "pause", checkpointPath); err != nil {
+				return nil, fmt.Errorf("while checkpointing pause: %w", err)
+			}
+		default:
+			return nil, fmt.Errorf("unsupported snapshot scope: %v", req.GetScope())
 		}
-		if len(ddv) == 0 {
-			return nil, fmt.Errorf("no durable-dir volumes found for DATA snapshot")
+
+		// Record the snapshot before cleanup. A retry resumes at cleanup rather
+		// than attempting the destructive checkpoint a second time.
+		var err error
+		snapshotFiles, err = listSnapshotFiles(checkpointPath)
+		if err != nil {
+			return nil, fmt.Errorf("while listing checkpoint files: %w", err)
 		}
-		if err := rcmd.cmdFsCheckpoint(ctx, "pause", checkpointPath, ddv); err != nil {
-			return nil, fmt.Errorf("while fscheckpointing durable-dir %q: %w", ddv[0], err)
+		if len(snapshotFiles) == 0 {
+			return nil, errors.New("checkpoint produced no snapshot files")
 		}
-	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL:
-		// Checkpoint pause container (root of the sandbox)
-		if err := rcmd.cmdCheckpoint(ctx, "pause", checkpointPath); err != nil {
-			return nil, fmt.Errorf("while checkpointing pause: %w", err)
+		if req.GetOperationId() != "" {
+			if err := operations.Save(req.GetOperationId(), operationstate.Record{
+				Phase:         operationstate.PhasePrepared,
+				SnapshotFiles: snapshotFiles,
+			}); err != nil {
+				return nil, fmt.Errorf("while recording captured CheckpointWorkload operation: %w", err)
+			}
 		}
-	default:
-		return nil, fmt.Errorf("unsupported snapshot scope: %v", req.GetScope())
 	}
 
 	// After checkpointing the sandbox root, runsc may no longer have a usable
@@ -324,11 +364,13 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 
 	s.cleanupActorNetworkOrExit(ctx, "Failed to clean up actor network after checkpoint")
 
-	// Report exactly the files runsc wrote so atelet ships precisely this set
-	// (checkpoint.img plus any pages images), rather than a hardcoded list.
-	snapshotFiles, err := listSnapshotFiles(checkpointPath)
-	if err != nil {
-		return nil, fmt.Errorf("while listing checkpoint files: %w", err)
+	if req.GetOperationId() != "" {
+		if err := operations.Save(req.GetOperationId(), operationstate.Record{
+			Phase:         operationstate.PhaseCompleted,
+			SnapshotFiles: snapshotFiles,
+		}); err != nil {
+			return nil, fmt.Errorf("while recording completed CheckpointWorkload operation: %w", err)
+		}
 	}
 
 	s.actorLogger.EmitLifecycleLog("Actor checkpointed", req.GetAtespace(), req.GetActorName(), req.GetActorUid(), req.GetActorTemplateNamespace(), req.GetActorTemplateName())

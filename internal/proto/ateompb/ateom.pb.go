@@ -458,7 +458,10 @@ type CheckpointWorkloadRequest struct {
 	// atelet fetched it to (see RunWorkloadRequest). Empty for gVisor.
 	RuntimeAssetPaths map[string]string `protobuf:"bytes,9,rep,name=runtime_asset_paths,json=runtimeAssetPaths,proto3" json:"runtime_asset_paths,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// What content to include in the checkpoint.
-	Scope         SnapshotScope `protobuf:"varint,10,opt,name=scope,proto3,enum=ateom.SnapshotScope" json:"scope,omitempty"`
+	Scope SnapshotScope `protobuf:"varint,10,opt,name=scope,proto3,enum=ateom.SnapshotScope" json:"scope,omitempty"`
+	// Stable identity supplied by atelet. It includes the destination snapshot
+	// prefix, allowing separate checkpoints of the same actor to be distinguished.
+	OperationId   string `protobuf:"bytes,11,opt,name=operation_id,json=operationId,proto3" json:"operation_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -561,6 +564,13 @@ func (x *CheckpointWorkloadRequest) GetScope() SnapshotScope {
 		return x.Scope
 	}
 	return SnapshotScope_SNAPSHOT_SCOPE_UNSPECIFIED
+}
+
+func (x *CheckpointWorkloadRequest) GetOperationId() string {
+	if x != nil {
+		return x.OperationId
+	}
+	return ""
 }
 
 type CheckpointWorkloadResponse struct {
@@ -798,7 +808,7 @@ const file_ateom_proto_rawDesc = "" +
 	"\rHTTPGetAction\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x12\n" +
 	"\x04port\x18\x02 \x01(\x05R\x04port\"\x15\n" +
-	"\x13RunWorkloadResponse\"\xb0\x04\n" +
+	"\x13RunWorkloadResponse\"\xd3\x04\n" +
 	"\x19CheckpointWorkloadRequest\x12\x1a\n" +
 	"\batespace\x18\x01 \x01(\tR\batespace\x12\x1d\n" +
 	"\n" +
@@ -812,7 +822,8 @@ const file_ateom_proto_rawDesc = "" +
 	"\x13snapshot_uri_prefix\x18\b \x01(\tR\x11snapshotUriPrefix\x12g\n" +
 	"\x13runtime_asset_paths\x18\t \x03(\v27.ateom.CheckpointWorkloadRequest.RuntimeAssetPathsEntryR\x11runtimeAssetPaths\x12*\n" +
 	"\x05scope\x18\n" +
-	" \x01(\x0e2\x14.ateom.SnapshotScopeR\x05scope\x1aD\n" +
+	" \x01(\x0e2\x14.ateom.SnapshotScopeR\x05scope\x12!\n" +
+	"\foperation_id\x18\v \x01(\tR\voperationId\x1aD\n" +
 	"\x16RuntimeAssetPathsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"C\n" +

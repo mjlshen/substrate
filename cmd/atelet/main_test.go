@@ -29,6 +29,7 @@ import (
 
 	"github.com/agent-substrate/substrate/internal/ateerrors"
 	"github.com/agent-substrate/substrate/internal/ateompath"
+	"github.com/agent-substrate/substrate/internal/operationstate"
 	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
 	"github.com/agent-substrate/substrate/internal/proto/ateompb"
 	"github.com/google/go-cmp/cmp"
@@ -86,6 +87,33 @@ func TestWriteFileAtomic(t *testing.T) {
 	})
 }
 
+func TestMoveFileIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "source")
+	dst := filepath.Join(dir, "destination")
+	if err := os.WriteFile(src, []byte("new snapshot"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := moveFileIdempotent(src, dst); err != nil {
+		t.Fatalf("first moveFileIdempotent: %v", err)
+	}
+	// The source is now gone and the destination exists, exactly the state a
+	// retry observes after losing the first call's response.
+	if err := moveFileIdempotent(src, dst); err != nil {
+		t.Fatalf("replayed moveFileIdempotent: %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "new snapshot" {
+		t.Errorf("destination = %q, want %q", got, "new snapshot")
+	}
+	if _, err := os.Stat(src); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("source still exists after move: %v", err)
+	}
+}
+
 // validRunRequest, validCheckpointRequest, and validRestoreRequest build
 // requests whose every field passes validation; the per-request tests below
 // break one field per case.
@@ -136,6 +164,37 @@ func validRestoreRequest() *ateletpb.RestoreRequest {
 			},
 		},
 		Scope: ateletpb.SnapshotScope_SNAPSHOT_SCOPE_FULL,
+	}
+}
+
+func TestCompletedCheckpointIsReplayed(t *testing.T) {
+	root := t.TempDir()
+	s := &AteomHerder{
+		operationsDir: func(actorUID string) string {
+			return filepath.Join(root, actorUID)
+		},
+	}
+	ctx := context.Background()
+	req := validCheckpointRequest()
+	store := s.operationStore(req.GetActorUid())
+	if err := store.Save(checkpointOperationID(req), operationstate.Record{Phase: operationstate.PhaseCompleted}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Checkpoint(ctx, req); err != nil {
+		t.Fatalf("completed Checkpoint replay returned error: %v", err)
+	}
+}
+
+func TestCheckpointOperationIDUsesWorkflowIdentity(t *testing.T) {
+	checkpointA := validCheckpointRequest()
+	checkpointB := validCheckpointRequest()
+	checkpointB.Spec.Containers[0].Image = "refreshed-image"
+	if checkpointOperationID(checkpointA) != checkpointOperationID(checkpointB) {
+		t.Fatal("Checkpoint operation ID changed with mutable workload details")
+	}
+	checkpointB.GetExternalConfig().SnapshotUriPrefix = "gs://bucket/actors/1/snapshots/3/"
+	if checkpointOperationID(checkpointA) == checkpointOperationID(checkpointB) {
+		t.Fatal("Checkpoint operation ID did not change with snapshot destination")
 	}
 }
 

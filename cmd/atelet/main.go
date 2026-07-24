@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -34,6 +35,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/ateinterceptors"
 	"github.com/agent-substrate/substrate/internal/ateompath"
 	"github.com/agent-substrate/substrate/internal/imagecache"
+	"github.com/agent-substrate/substrate/internal/operationstate"
 	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
 	"github.com/agent-substrate/substrate/internal/proto/ateompb"
 	"github.com/agent-substrate/substrate/internal/resources"
@@ -195,6 +197,15 @@ type AteomHerder struct {
 	imageCache    *imagecache.Store
 	anonGCSClient ategcs.ObjectStorage
 	gcsClient     ategcs.ObjectStorage
+
+	// Actor lifecycle operations are serialized per actor. This makes duplicate
+	// concurrent RPCs share the same durable phase transition.
+	actorLocksMu sync.Mutex
+	actorLocks   map[string]*actorLock
+
+	// operationsDir is overridden by unit tests; production uses the shared
+	// per-actor directory from ateompath.
+	operationsDir func(actorUID string) string
 }
 
 var _ ateletpb.AteomHerderServer = (*AteomHerder)(nil)
@@ -316,6 +327,18 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 	}
 
 	actorUID, atespace, actorName := req.GetActorUid(), req.GetAtespace(), req.GetActorName()
+	unlock := s.lockActor(actorUID)
+	defer unlock()
+
+	operationID := checkpointOperationID(req)
+	operations := s.operationStore(actorUID)
+	operation, err := operations.Load(operationID)
+	if err != nil {
+		return nil, fmt.Errorf("while loading Checkpoint operation: %w", err)
+	}
+	if operation != nil && operation.Phase == operationstate.PhaseCompleted {
+		return &ateletpb.CheckpointResponse{}, nil
+	}
 
 	// Checkpoint requests no longer carry the sandbox config; recover the
 	// version this actor was started with from the on-node record and re-fetch
@@ -350,6 +373,7 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 		Spec:                   buildAteomWorkloadSpec(req.GetSpec()),
 		Scope:                  toAteomSnapshotScope(req.GetScope()),
 		ActorUid:               actorUID,
+		OperationId:            operationID,
 	})
 	if err != nil {
 		// TODO: Ateom should classify checkpoint failures, and set "should-crash"
@@ -363,21 +387,27 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 
 	switch req.GetType() {
 	case ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL:
-		// TODO(#362): Because we do not cache the external snapshot files when upload fails, we have to mark the Actor as CRASHED.
 		if err := s.uploadExternalCheckpoint(ctx, req, checkpointDir, sandboxRec); err != nil {
-			return nil, ateerrors.NewGRPCError(ctx, codes.DataLoss, ateerrors.ReasonFaileSaveSnapshot, ateerrors.ActorCrashedMetadata(), fmt.Errorf("%w: while uploading external snapshot: %w", ateerrors.ReasonFaileSaveSnapshot, err))
+			return nil, fmt.Errorf("while uploading external snapshot: %w", err)
 		}
 	case ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL:
 		if err := s.moveLocalCheckpoint(ctx, req, checkpointDir, sandboxRec); err != nil {
-			return nil, ateerrors.NewGRPCError(ctx, codes.DataLoss, ateerrors.ReasonFaileSaveSnapshot, ateerrors.ActorCrashedMetadata(), fmt.Errorf("%w: while moving to local snapshot: %w", ateerrors.ReasonFaileSaveSnapshot, err))
+			return nil, fmt.Errorf("while publishing local snapshot: %w", err)
 		}
 	default:
 		return nil, fmt.Errorf("unexpected checkpoint type: %v", req.GetType())
 	}
 
-	// Note: we do not crash the actor if resetting the directory fails.
+	if err := operations.Save(operationID, operationstate.Record{Phase: operationstate.PhaseCompleted}); err != nil {
+		return nil, fmt.Errorf("while recording completed Checkpoint operation: %w", err)
+	}
+
+	// The snapshot is already durable and the completion record makes retries
+	// succeed. Cleanup is therefore best-effort and must not turn the completed
+	// operation back into a failure.
 	if err := resetActorDirs(actorUID); err != nil {
-		return nil, fmt.Errorf("while resetting actor dirs: %w", err)
+		slog.WarnContext(ctx, "Failed to reset actor directories after completed checkpoint",
+			slog.String("actorUID", actorUID), slog.Any("err", err))
 	}
 
 	return &ateletpb.CheckpointResponse{}, nil
@@ -399,13 +429,14 @@ func (s *AteomHerder) moveLocalCheckpoint(ctx context.Context, req *ateletpb.Che
 		return fmt.Errorf("while creating local checkpoint directory: %w", err)
 	}
 
-	// Move exactly the files ateom reported.
+	// Move exactly the files ateom reported. A retry accepts files already moved
+	// by a partial prior attempt.
 	for _, fileName := range rec.SnapshotFiles {
 		src := filepath.Join(checkpointDir, fileName)
 		dst := filepath.Join(localCheckpointPath, fileName)
 		recordSnapshotSize(ctx, strings.TrimSuffix(fileName, ".img"), src, req.GetActorTemplateNamespace(), req.GetActorTemplateName())
 
-		if err := os.Rename(src, dst); err != nil {
+		if err := moveFileIdempotent(src, dst); err != nil {
 			return fmt.Errorf("failed to move %s to %s: %w", src, dst, err)
 		}
 	}
@@ -416,10 +447,26 @@ func (s *AteomHerder) moveLocalCheckpoint(ctx context.Context, req *ateletpb.Che
 	if err != nil {
 		return fmt.Errorf("while marshaling snapshot manifest: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(localCheckpointPath, sandboxManifestName), manifest, 0o600); err != nil {
+	if err := writeFileAtomic(filepath.Join(localCheckpointPath, sandboxManifestName), manifest, 0o600); err != nil {
 		return fmt.Errorf("while writing snapshot manifest: %w", err)
 	}
 
+	return nil
+}
+
+func moveFileIdempotent(src, dst string) error {
+	if err := os.Rename(src, dst); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		info, dstErr := os.Stat(dst)
+		if dstErr != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("already-published destination %s is not a regular file", dst)
+		}
+	}
 	return nil
 }
 

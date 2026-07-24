@@ -99,6 +99,18 @@ func ActorSandboxAssetsFile(actorUID string) string {
 	)
 }
 
+// ActorOperationsDir contains durable idempotency records for actor lifecycle
+// RPCs. The component keeps atelet and ateom records separate. This directory
+// deliberately lives outside every directory reset by atelet so an ambiguous
+// RPC result can be recovered after the runtime has crossed its state boundary.
+func ActorOperationsDir(actorUID, component string) string {
+	return filepath.Join(
+		ActorPath(actorUID),
+		"operations",
+		component,
+	)
+}
+
 func RunSCStateDir(actorUID string) string {
 	return filepath.Join(
 		ActorPath(actorUID),
